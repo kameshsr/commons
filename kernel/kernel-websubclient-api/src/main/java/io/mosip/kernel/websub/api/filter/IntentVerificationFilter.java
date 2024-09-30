@@ -1,116 +1,92 @@
-package io.mosip.kernel.websub.api.filter;
+package io.mosip.kernel.websub.api.config;
 
-import java.io.IOException;
+import java.lang.reflect.Method;
+import java.util.HashMap;
 import java.util.Map;
-import java.util.Set;
 
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
-
-import org.owasp.encoder.Encode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.aop.support.AopUtils;
+import org.springframework.beans.BeansException;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.ApplicationContextAware;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.EmbeddedValueResolverAware;
+import org.springframework.stereotype.Component;
+import org.springframework.util.StringValueResolver;
 
 import io.mosip.kernel.websub.api.annotation.PreAuthenticateContentAndVerifyIntent;
-import io.mosip.kernel.websub.api.config.IntentVerificationConfig;
-import io.mosip.kernel.websub.api.constants.WebSubClientConstants;
-import io.mosip.kernel.websub.api.constants.WebSubClientErrorCode;
-import io.mosip.kernel.websub.api.exception.WebSubClientException;
-import io.mosip.kernel.websub.api.verifier.IntentVerifier;
-import io.swagger.models.HttpMethod;
-import lombok.Setter;
+import io.mosip.kernel.websub.api.filter.IntentVerificationFilter;
 
 /**
- * This filter is used for handle intent verification request by hub after subscribe and unsubscribe
- * operations with help of metadata collected by {@link PreAuthenticateContentAndVerifyIntent} and
- * {@link IntentVerificationConfig} class.
+ * This class is resposible for loading all the metadata with help of
+ * {@link PreAuthenticateContentAndVerifyIntent} annotation after application
+ * context is ready for handling get endpoint request sent by hub for intent
+ * verifications after subscribe and unsubscribe operation.
  * 
  * @author Urvil Joshi
  *
  */
-public class IntentVerificationFilter extends OncePerRequestFilter {
-	
-	private static final Logger LOGGER = LoggerFactory.getLogger(IntentVerificationFilter.class);
+@Component
+public class IntentVerificationConfig implements ApplicationContextAware, EmbeddedValueResolverAware {
 
-	private IntentVerifier intentVerifier;
-
-	@Setter
 	private Map<String, String> mappings = null;
+	private StringValueResolver resolver = null;
 
-	public IntentVerificationFilter(IntentVerifier intentVerifier) {
-		this.intentVerifier = intentVerifier;
+	private static final Logger logger = LoggerFactory.getLogger(IntentVerificationConfig.class);
+
+	@Override
+	public void setEmbeddedValueResolver(StringValueResolver resolver) {
+		this.resolver = resolver;
 	}
 
 	@Override
-	protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
-			throws ServletException, IOException {
-		logger.debug("inside doFilterInternal");
-		logger.debug("HttpServletRequest request- "+request);
-		String topic=matchCallbackURL(request.getRequestURI());
-		if (request.getMethod().equals(HttpMethod.GET.name()) && topic!=null) {
-			String topicReq = request.getParameter(WebSubClientConstants.HUB_TOPIC);			
-			String modeReq = request.getParameter(WebSubClientConstants.HUB_MODE);
-			String mode = request.getParameter("intentMode");
-	        if(modeReq.equals("denied")) {
-	        	String reason = request.getParameter("hub.reason");
-	        	reason = reason.replaceAll("[\n\r\t]", " - ");
-	        	LOGGER.error("intent verification failed : {}",reason);
-	        	response.setStatus(HttpServletResponse.SC_NOT_FOUND);
-	        	response.getWriter().flush();
-				response.getWriter().close();
-	        }
-			if (intentVerifier.isIntentVerified(topic,
-					mode, topicReq, modeReq)) {
-				response.setStatus(HttpServletResponse.SC_ACCEPTED);
-				try {
-					String challange =request.getParameter(WebSubClientConstants.HUB_CHALLENGE);
-					String encodedChallange = Encode.forHtml(challange);
-					response.getWriter().write(encodedChallange);
-					response.getWriter().flush();
-					response.getWriter().close();
-				} catch (IOException exception) {
-					LOGGER.error("error received while writing challange back"+exception.getMessage());
-					throw new WebSubClientException(WebSubClientErrorCode.IO_ERROR.getErrorCode(),
-							WebSubClientErrorCode.IO_ERROR.getErrorMessage().concat(exception.getMessage()));
-				}
-
-			} else {
-				topicReq = topicReq.replaceAll("[\n\r\t]", " - ");			
-				modeReq = modeReq.replaceAll("[\n\r\t]", " - ");			
-				mode = mode.replaceAll("[\n\r\t]", " - ");
-				LOGGER.error("intent verification failed: {} {} {} {}",topic,mode,topicReq,modeReq);
-				response.setStatus(HttpServletResponse.SC_NOT_FOUND);
-				response.getWriter().flush();
-				response.getWriter().close();
+	public void setApplicationContext(ApplicationContext applicationContext) throws BeansException {
+		logger.info("inside setApplicationContext");
+		mappings = new HashMap<>();
+		for (String beanName : applicationContext.getBeanDefinitionNames()) {
+			//Skip processing this intentVerificationConfig bean.
+			if(beanName.equals("intentVerificationConfig")) {
+				continue;
 			}
+			if (!((ConfigurableApplicationContext) applicationContext).getBeanFactory().getBeanDefinition(beanName)
+					.isLazyInit()) {
+				Object obj = applicationContext.getBean(beanName);
+				logger.info("bean-"+ beanName);
+				Class<?> objClazz = obj.getClass();
+				logger.info("objClazz"+ objClazz);
+				if (AopUtils.isAopProxy(obj)) {
 
-		} else {
-			filterChain.doFilter(request, response);
-		}
-	}
+					objClazz = AopUtils.getTargetClass(obj);
+				}
 
-	private String matchCallbackURL(String requestURI) {
-		if(mappings.containsKey(requestURI)) {
-			return mappings.get(requestURI);
-		}else {
-			Set<String> mappingKeys=mappings.keySet();
-			for(String keys:mappingKeys){
-				int pathParamIndex=keys.indexOf("/{");
-				if(pathParamIndex==-1) {
-					continue;
+				for (Method method : objClazz.getDeclaredMethods()) {
+					logger.info("method name-"+method);
+					if (method.isAnnotationPresent(PreAuthenticateContentAndVerifyIntent.class)) {
+						PreAuthenticateContentAndVerifyIntent preAuthenticateContent = method
+								.getAnnotation(PreAuthenticateContentAndVerifyIntent.class);
+
+						String topic = preAuthenticateContent.topic();
+						logger.info("topic- "+topic);
+
+						String callback = preAuthenticateContent.callback();
+						logger.info("callback- "+callback);
+						if (topic.startsWith("${") && topic.endsWith("}")) {
+							topic = resolver.resolveStringValue(topic);
+						}
+
+						if (callback.startsWith("${") && callback.endsWith("}")) {
+							callback = resolver.resolveStringValue(callback);
+						}
+						mappings.put(callback, topic);
+						logger.info("mapping"+ mappings);
+					}
 				}
-				String url =keys.substring(0,pathParamIndex );
-				if(requestURI.contains(url)) {
-					int pathParamCount=keys.split("\\/\\{").length - 1;
-					if(requestURI.substring(pathParamIndex).split("\\/").length-1==pathParamCount) {
-						return mappings.get(keys);
-					};
-				}
+				IntentVerificationFilter intentVerificationFilter = applicationContext
+						.getBean(IntentVerificationFilter.class);
+				intentVerificationFilter.setMappings(mappings);
+				logger.info("mapping after setting value-"+mappings);
 			}
 		}
-		return null;
 	}
 }
